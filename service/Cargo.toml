@@ -1,0 +1,8 @@
+[package]
+name = "hisoka-service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+windows-service.workspace = true
