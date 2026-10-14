@@ -1,4 +1,5 @@
 use chrono::Local;
+use hisoka_core::{Config, LogConfig};
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -28,8 +29,9 @@ fn app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-const RETENTION_DAYS: u64 = 7;          // later: read from config.toml
-const MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
+fn config_path() -> PathBuf {
+    app_dir().join("config.toml")
+}
 
 fn log_dir() -> PathBuf {
     app_dir().join("logs")
@@ -45,9 +47,10 @@ fn log(msg: &str) {
     }
 }
 
-fn prune_logs() {
+fn prune_logs(cfg: &LogConfig) {
     let Ok(entries) = fs::read_dir(log_dir()) else { return };
-    let cutoff = SystemTime::now() - Duration::from_secs(RETENTION_DAYS * 24 * 3600);
+    let cutoff = SystemTime::now() - Duration::from_secs(cfg.retention_days as u64 * 24 * 3600);
+    let max_bytes = cfg.max_mb as u64 * 1024 * 1024;
 
     let mut files: Vec<(PathBuf, SystemTime, u64)> = entries
         .flatten()
@@ -73,7 +76,7 @@ fn prune_logs() {
     files.sort_by_key(|(_, modified, _)| *modified);
     let mut total: u64 = files.iter().map(|(_, _, s)| s).sum();
     for (p, _, size) in &files {
-        if total <= MAX_TOTAL_BYTES {
+        if total <= max_bytes {
             break;
         }
         let _ = fs::remove_file(p);
@@ -111,6 +114,14 @@ fn set_state(
 }
 
 fn run() -> windows_service::Result<()> {
+    let cfg = match Config::load_or_create(&config_path()) {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!("config error, using defaults: {e:#}"));
+            Config::default()
+        }
+    };
+
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
     let handle = service_control_handler::register(SERVICE_NAME, move |event| match event {
@@ -122,18 +133,19 @@ fn run() -> windows_service::Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     })?;
 
-    prune_logs();
+    prune_logs(&cfg.log);
     let mut last_prune = Instant::now();
 
     set_state(&handle, ServiceState::Running)?;
     log("service started");
+    log(&format!("config: {cfg:?}"));
 
     loop {
         match stop_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
                 if last_prune.elapsed() >= Duration::from_secs(24 * 3600) {
-                    prune_logs();
+                    prune_logs(&cfg.log);
                     last_prune = Instant::now();
                 }
                 // TODO ...

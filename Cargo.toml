@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["service", "cli"]
+members = ["service", "cli", "core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,4 +8,5 @@ edition = "2024"
 authors = ["NeyrowZ"]
 
 [workspace.dependencies]
+hisoka-core = { path = "core" }
 windows-service = "0.8.1"
