@@ -8,5 +8,6 @@ edition = "2024"
 authors = ["NeyrowZ"]
 
 [workspace.dependencies]
+anyhow = "1.0.104"
 hisoka-core = { path = "core" }
 windows-service = "0.8.1"

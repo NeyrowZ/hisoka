@@ -53,6 +53,10 @@ Name: "autostart"; \
     Description: "Start the Hisoka service automatically with Windows"; \
     GroupDescription: "Service configuration:"
 
+[UninstallRun]
+Filename: "{app}\bin\hisoka.exe"; Parameters: "wildcard unapply"; \
+    Flags: runhidden; RunOnceId: "UnapplyNrpt"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
 

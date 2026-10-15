@@ -1,23 +1,13 @@
+pub mod dns;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::{BTreeMap, HashMap}, fs, net::IpAddr, path::Path};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs, net::IpAddr, path::Path};
 
-const HEADER: &str =
-    "# Hisoka configuration\n# Restart the service after editing: hisoka restart\n\n";
+const HEADER: &str = "# Hisoka configuration\n# Restart the service after editing: hisoka restart\n\n";
 
-/// Windows always queries DNS servers on port 53.
 pub const DNS_PORT: u16 = 53;
-/// Seconds a client may cache an answer.
 pub const TTL_SECS: u32 = 30;
-
-/// Port the resolver binds to. Dev-only override: set HISOKA_PORT=5353
-/// to avoid clashing with something already using 53.
-pub fn dns_port() -> u16 {
-    std::env::var("HISOKA_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DNS_PORT)
-}
 
 pub type Rules = BTreeMap<String, Rule>;
 
@@ -25,25 +15,20 @@ pub type Rules = BTreeMap<String, Rule>;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub log: LogConfig,
-    /// Wildcard rules by id.
     pub wildcard: Rules,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
-    /// Delete log files older than this many days.
     pub retention_days: u32,
-    /// Delete the oldest logs when the folder exceeds this size.
     pub max_mb: u32,
-    /// Log every DNS query (noisy, keep off).
     pub debug: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// "*.example.test" (wildcard) or "api.example.test" (exact).
     pub pattern: String,
     pub address: IpAddr,
 }
@@ -53,8 +38,6 @@ impl Default for LogConfig {
         Self { retention_days: 7, max_mb: 10, debug: false }
     }
 }
-
-// ---------- pattern + id rules ----------
 
 fn validate_label(label: &str) -> Result<()> {
     if label.is_empty() || label.len() > 63 {
@@ -69,8 +52,6 @@ fn validate_label(label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lowercase, strip a trailing dot, and check the grammar:
-/// either an exact name, or `*.` followed by an exact name.
 pub fn normalize_pattern(raw: &str) -> Result<String> {
     let p = raw.trim().trim_end_matches('.').to_ascii_lowercase();
     if p.is_empty() {
@@ -96,12 +77,28 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn nrpt_namespaces(rules: &Rules) -> Vec<String> {
+    let all: BTreeSet<String> = rules
+        .values()
+        .filter_map(|r| normalize_pattern(&r.pattern).ok())
+        .map(|p| match p.strip_prefix('*') {
+            Some(suffix) => suffix.to_string(),
+            None => p,
+        })
+        .collect();
+    all.iter()
+        .filter(|ns| {
+            !all.iter()
+                .any(|s| s.starts_with('.') && s != *ns && ns.ends_with(s.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
 // ---------- matching ----------
 
-/// Built once from a validated config; `find` is the per-query lookup.
 pub struct Matcher {
     exact: HashMap<String, (String, Rule)>,
-    /// (suffix with leading dot, id, rule), longest suffix first.
     wild: Vec<(String, String, Rule)>,
 }
 
@@ -122,7 +119,6 @@ impl Matcher {
         Self { exact, wild }
     }
 
-    /// Exact name first, then the longest matching wildcard suffix.
     pub fn find(&self, name: &str) -> Option<(&str, &Rule)> {
         let n = name.trim_end_matches('.').to_ascii_lowercase();
         if let Some((id, rule)) = self.exact.get(&n) {
@@ -157,7 +153,6 @@ impl Config {
         Ok(())
     }
 
-    /// Read the file; returns defaults if it doesn't exist. Never writes.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -193,8 +188,6 @@ impl Config {
     pub fn matcher(&self) -> Matcher {
         Matcher::new(&self.wildcard)
     }
-
-    // ----- rule editing (each validates the whole config, rolls back on error) -----
 
     pub fn add_rule(&mut self, id: &str, pattern: &str, address: &str) -> Result<()> {
         if self.wildcard.contains_key(id) {
@@ -249,8 +242,6 @@ impl Config {
             .with_context(|| format!("no rule named '{id}'"))
     }
 
-    /// Set a scalar by dotted key, e.g. "log.retention_days" = "14".
-    /// Rules are edited with add_rule / set_rule / remove_rule instead.
     pub fn set_key(&mut self, key: &str, raw: &str) -> Result<()> {
         let mut root = toml::Value::try_from(&*self)?;
 
@@ -280,5 +271,126 @@ impl Config {
         updated.validate()?;
         *self = updated;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(rules: &[(&str, &str, &str)]) -> Config {
+        let mut c = Config::default();
+        for (id, p, a) in rules {
+            c.add_rule(id, p, a).unwrap();
+        }
+        c
+    }
+
+    fn found(c: &Config, name: &str) -> Option<String> {
+        c.matcher().find(name).map(|(id, _)| id.to_string())
+    }
+
+    #[test]
+    fn wildcard_matches_subdomains_but_not_bare_domain() {
+        let c = cfg(&[("dev", "*.test", "127.0.0.1")]);
+        assert_eq!(found(&c, "a.test"), Some("dev".into()));
+        assert_eq!(found(&c, "a.b.test"), Some("dev".into()));
+        assert_eq!(found(&c, "test"), None);
+        assert_eq!(found(&c, "nottest"), None);
+        assert_eq!(found(&c, "a.test.com"), None);
+    }
+
+    #[test]
+    fn most_specific_wins() {
+        let c = cfg(&[
+            ("dev", "*.test", "127.0.0.1"),
+            ("stg", "*.staging.test", "10.0.0.5"),
+            ("api", "api.staging.test", "10.0.0.9"),
+        ]);
+        assert_eq!(found(&c, "x.test"), Some("dev".into()));
+        assert_eq!(found(&c, "x.staging.test"), Some("stg".into()));
+        assert_eq!(found(&c, "api.staging.test"), Some("api".into()));
+    }
+
+    #[test]
+    fn case_and_trailing_dot_are_ignored() {
+        let c = cfg(&[("dev", "*.Test.", "127.0.0.1")]);
+        assert_eq!(found(&c, "FOO.TEST."), Some("dev".into()));
+        assert_eq!(c.wildcard["dev"].pattern, "*.test");
+    }
+
+    #[test]
+    fn bad_patterns_are_rejected() {
+        let mut c = Config::default();
+        for bad in ["", "*", "*.", "a*.test", "*.*.test", "-a.test", "a..test", "a b.test", ".test"] {
+            assert!(c.add_rule("x", bad, "127.0.0.1").is_err(), "accepted '{bad}'");
+        }
+    }
+
+    #[test]
+    fn bad_ids_and_addresses_are_rejected() {
+        let mut c = Config::default();
+        assert!(c.add_rule("bad id", "*.test", "127.0.0.1").is_err());
+        assert!(c.add_rule("ok", "*.test", "not-an-ip").is_err());
+        assert!(c.wildcard.is_empty());
+    }
+
+    #[test]
+    fn duplicate_patterns_are_rejected_and_rolled_back() {
+        let mut c = cfg(&[("a", "*.test", "127.0.0.1")]);
+        assert!(c.add_rule("b", "*.TEST", "127.0.0.2").is_err());
+        assert_eq!(c.wildcard.len(), 1);
+    }
+
+    #[test]
+    fn set_and_remove() {
+        let mut c = cfg(&[("a", "*.test", "127.0.0.1")]);
+        c.set_rule("a", Some("*.dev"), Some("::1")).unwrap();
+        assert_eq!(c.wildcard["a"].pattern, "*.dev");
+        assert!(c.set_rule("a", None, None).is_err());
+        assert!(c.set_rule("missing", Some("*.x"), None).is_err());
+        c.remove_rule("a").unwrap();
+        assert!(c.remove_rule("a").is_err());
+    }
+
+    #[test]
+    fn toml_roundtrip() {
+        let c = cfg(&[("dev", "*.test", "127.0.0.1"), ("api", "api.test", "::1")]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.wildcard, c.wildcard);
+    }
+
+    #[test]
+    fn hand_written_inline_tables_load() {
+        let text = r#"
+            [wildcard]
+            dev = { pattern = "*.test", address = "127.0.0.1" }
+        "#;
+        let c: Config = toml::from_str(text).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.wildcard["dev"].address.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn set_key_scalars() {
+        let mut c = Config::default();
+        c.set_key("log.max_mb", "20").unwrap();
+        assert_eq!(c.log.max_mb, 20);
+        assert!(c.set_key("log.max_mb", "0").is_err());
+        assert!(c.set_key("wildcard", "x").is_err());
+        assert!(c.set_key("nope.key", "1").is_err());
+    }
+
+    #[test]
+    fn nrpt_namespaces_drop_redundant_entries() {
+        let c = cfg(&[
+            ("a", "*.test", "127.0.0.1"),
+            ("b", "*.dev.test", "127.0.0.1"),
+            ("c", "api.test", "127.0.0.1"),
+            ("d", "solo.local", "127.0.0.1"),
+        ]);
+        assert_eq!(nrpt_namespaces(&c.wildcard), vec![".test", "solo.local"]);
     }
 }

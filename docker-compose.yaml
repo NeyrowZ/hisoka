@@ -1,0 +1,52 @@
+services:
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      CADDY_INGRESS_NETWORKS: web-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - web-proxy
+  main:
+    image: traefik/whoami
+    container_name: main
+    restart: unless-stopped
+    networks:
+      - web-proxy
+    labels:
+      caddy: http://conduite.test
+      caddy.reverse_proxy: "{{upstreams 80}}"
+  first:
+    image: traefik/whoami
+    container_name: first
+    restart: unless-stopped
+    networks:
+      - web-proxy
+    labels:
+      caddy: http://first.conduite.test
+      caddy.reverse_proxy: "{{upstreams 80}}"
+  second:
+    image: traefik/whoami
+    container_name: second
+    restart: unless-stopped
+    networks:
+      - web-proxy
+    labels:
+      caddy: http://second.conduite.test
+      caddy.reverse_proxy: "{{upstreams 80}}"
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  web-proxy:
+    external: true

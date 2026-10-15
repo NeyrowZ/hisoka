@@ -1,6 +1,7 @@
+mod nrpt;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hisoka_core::Config;
+use hisoka_core::{nrpt_namespaces, Config};
 use std::{path::PathBuf, time::Duration};
 use windows_service::{
     service::{ServiceAccess, ServiceState},
@@ -40,6 +41,10 @@ enum WildcardCmd {
         address: Option<String>,
     },
     Remove { id: String },
+    Match { name: String },
+    Apply,
+    Unapply,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +68,9 @@ enum Cmd {
 }
 
 fn app_dir() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("HISOKA_HOME") {
+        return Ok(PathBuf::from(home));
+    }
     let exe = std::env::current_exe().context("cannot locate hisoka.exe")?;
     exe.parent()
         .and_then(|bin| bin.parent())
@@ -144,35 +152,80 @@ fn main() -> Result<()> {
                     println!("defaults restored  (run `hisoka restart` to apply)");
                 }
             }
-        }Cmd::Wildcard { action } => {
-            let path = app_dir()?.join("config.toml");
-            let mut cfg = Config::load(&path)?;
-            match action {
-                WildcardCmd::List => {
-                    if cfg.wildcard.is_empty() {
-                        println!("no wildcard rules (add one with `hisoka wildcard add`)");
-                    }
-                    for (id, r) in &cfg.wildcard {
-                        println!("{id:<16} {:<30} -> {}", r.pattern, r.address);
-                    }
-                }
-                WildcardCmd::Add { id, pattern, address } => {
-                    cfg.add_rule(&id, &pattern, &address)?;
-                    cfg.save(&path)?;
-                    println!("added '{id}'  (run `hisoka restart` to apply)");
-                }
-                WildcardCmd::Set { id, pattern, address } => {
-                    cfg.set_rule(&id, pattern.as_deref(), address.as_deref())?;
-                    cfg.save(&path)?;
-                    println!("updated '{id}'  (run `hisoka restart` to apply)");
-                }
-                WildcardCmd::Remove { id } => {
-                    cfg.remove_rule(&id)?;
-                    cfg.save(&path)?;
-                    println!("removed '{id}'  (run `hisoka restart` to apply)");
-                }
+        }
+        Cmd::Wildcard { action } => wildcard_cmd(action)?,
+    }
+    Ok(())
+}
+
+fn wildcard_cmd(action: WildcardCmd) -> Result<()> {
+    match action {
+        WildcardCmd::Unapply => {
+            nrpt::unapply()?;
+            println!("removed all Hisoka DNS rules");
+            return Ok(());
+        }
+        WildcardCmd::Status => {
+            let s = nrpt::status()?;
+            if s.trim().is_empty() {
+                println!("no Hisoka DNS rules are applied");
+            } else {
+                print!("{s}");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let path = app_dir()?.join("config.toml");
+    let mut cfg = Config::load(&path)?;
+    match action {
+        WildcardCmd::List => {
+            if cfg.wildcard.is_empty() {
+                println!("no wildcard rules (add one with `hisoka wildcard add`)");
+            }
+            for (id, r) in &cfg.wildcard {
+                println!("{id:<16} {:<30} -> {}", r.pattern, r.address);
             }
         }
+        WildcardCmd::Add { id, pattern, address } => {
+            cfg.add_rule(&id, &pattern, &address)?;
+            cfg.save(&path)?;
+            println!("added '{id}'  (restart the service, then run `hisoka wildcard apply`)");
+        }
+        WildcardCmd::Set { id, pattern, address } => {
+            cfg.set_rule(&id, pattern.as_deref(), address.as_deref())?;
+            cfg.save(&path)?;
+            println!("updated '{id}'  (restart the service, then run `hisoka wildcard apply`)");
+        }
+        WildcardCmd::Remove { id } => {
+            cfg.remove_rule(&id)?;
+            cfg.save(&path)?;
+            println!("removed '{id}'  (restart the service, then run `hisoka wildcard apply`)");
+        }
+        WildcardCmd::Match { name } => match cfg.matcher().find(&name) {
+            Some((id, r)) => println!("{id} ({}) -> {}", r.pattern, r.address),
+            None => println!("no match (NXDOMAIN)"),
+        },
+        WildcardCmd::Apply => {
+            if !matches!(state(), Ok(ServiceState::Running)) {
+                eprintln!(
+                    "warning: the Hisoka service is not running, so these names will fail to \
+                     resolve until it is (console mode counts, ignore this if you use it)"
+                );
+            }
+            let ns = nrpt_namespaces(&cfg.wildcard);
+            nrpt::apply(&ns)?;
+            if ns.is_empty() {
+                println!("no rules: removed all Hisoka DNS rules");
+            } else {
+                for n in &ns {
+                    println!("  {n} -> 127.0.0.1");
+                }
+                println!("applied. Try: ping something{}", ns[0]);
+            }
+        }
+        WildcardCmd::Unapply | WildcardCmd::Status => unreachable!(),
     }
     Ok(())
 }

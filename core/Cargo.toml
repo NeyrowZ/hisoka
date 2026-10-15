@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
+anyhow.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
